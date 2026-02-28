@@ -1,0 +1,436 @@
+name: Build Universal Coverage Map
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      coverage_format:
+        description: 'jacoco, lcov, or c8'
+        required: true
+        default: 'c8'
+      coverage_path:
+        description: 'Path to coverage file (e.g. coverage/coverage-final.json, coverage/lcov.info, or target/site/jacoco/jacoco.xml)'
+        required: true
+        default: 'coverage/coverage-final.json'
+      test_list_command:
+        description: 'Optional command that prints one test id per line. If empty, auto-discovery is used.'
+        required: false
+        default: ''
+      test_run_command_template:
+        description: 'Optional command template to run ONE test. Use {{TEST}} placeholder. If empty, auto-discovery is used.'
+        required: false
+        default: ''
+      test_filter:
+        description: 'Optional regex filter applied to discovered test ids before mapping'
+        required: false
+        default: ''
+      max_tests:
+        description: 'Maximum number of tests to map (leave empty to run all discovered tests)'
+        required: false
+        default: ''
+      map_jobs:
+        description: 'Parallel workers for map generation'
+        required: false
+        default: '8'
+      build_command:
+        description: 'Build/install step. Use auto to detect stack, empty to skip, or provide an explicit command.'
+        required: false
+        default: 'auto'
+      build_mode:
+        description: 'Build behavior: auto (build if missing), always, or never'
+        required: false
+        default: 'auto'
+  schedule:
+    - cron: '0 2 * * *' # nightly 02:00 UTC
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: map-builder-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-map:
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_FORMAT: ${{ inputs.coverage_format || 'c8' }}
+      COVERAGE_PATH: ${{ inputs.coverage_path || 'coverage/coverage-final.json' }}
+      TEST_LIST_COMMAND: ${{ inputs.test_list_command || '' }}
+      TEST_RUN_TEMPLATE: ${{ inputs.test_run_command_template || '' }}
+      TEST_FILTER: ${{ inputs.test_filter || '' }}
+      MAX_TESTS: ${{ inputs.max_tests || '' }}
+      MAP_JOBS: ${{ inputs.map_jobs || '8' }}
+      BUILD_COMMAND: ${{ inputs.build_command || 'auto' }}
+      BUILD_MODE: ${{ inputs.build_mode || 'auto' }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: '1'
+      CCACHE_COMPRESSLEVEL: '6'
+      CCACHE_MAXSIZE: '3G'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache universal-coverage deps
+        uses: actions/cache@v4
+        with:
+          path: tools/universal-coverage/node_modules
+          key: ${{ runner.os }}-universal-coverage-${{ hashFiles('tools/universal-coverage/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-universal-coverage-
+
+      - name: Install universal-coverage tool deps
+        working-directory: tools/universal-coverage
+        run: npm install --prefer-offline --no-audit --no-fund
+
+      - name: Install ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          mkdir -p "$CCACHE_DIR"
+
+      - name: Restore ccache
+        id: ccache_restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-node-coverage-v1-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-node-coverage-v1-${{ github.ref_name }}-
+            ${{ runner.os }}-ccache-node-coverage-v1-
+
+      - name: Resolve build command
+        id: resolve_build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          requested="${BUILD_COMMAND:-auto}"
+          requested="$(echo "$requested" | xargs)"
+          detected_stack="unknown"
+          resolved=""
+
+          if [ -n "$requested" ] && [ "$requested" != "auto" ]; then
+            detected_stack="manual"
+            resolved="$requested"
+          elif [ -f "tools/test.py" ] && [ -f "configure" ]; then
+            detected_stack="node-core"
+            resolved='make build-ci -j$(nproc) V=1 CONFIG_FLAGS="--coverage" && make coverage-build-js'
+          elif [ -f "package.json" ]; then
+            detected_stack="node"
+            if [ -f "pnpm-lock.yaml" ]; then
+              resolved='corepack enable && pnpm install --frozen-lockfile'
+            elif [ -f "yarn.lock" ]; then
+              resolved='corepack enable && yarn install --immutable'
+            elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+              resolved='npm ci --prefer-offline --no-audit --no-fund'
+            else
+              resolved='npm install --prefer-offline --no-audit --no-fund'
+            fi
+          elif [ -f "pom.xml" ]; then
+            detected_stack="maven"
+            resolved='mvn -q -DskipTests package'
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            detected_stack="gradle"
+            if [ -x "./gradlew" ]; then
+              resolved='./gradlew assemble -x test'
+            else
+              resolved='gradle assemble -x test'
+            fi
+          elif [ -f "Cargo.toml" ]; then
+            detected_stack="rust"
+            resolved='cargo build --locked || cargo build'
+          elif [ -f "go.mod" ]; then
+            detected_stack="go"
+            resolved='go mod download'
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            detected_stack="python"
+            if [ -f "requirements.txt" ]; then
+              resolved='python -m pip install --upgrade pip && python -m pip install -r requirements.txt'
+            else
+              resolved='python -m pip install --upgrade pip'
+            fi
+          elif ls *.sln *.csproj >/dev/null 2>&1; then
+            detected_stack="dotnet"
+            resolved='dotnet restore && dotnet build --no-restore'
+          fi
+
+          {
+            echo "stack=$detected_stack"
+            echo "command<<EOF"
+            echo "$resolved"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$resolved" ]; then
+            echo "Resolved build stack: $detected_stack"
+            echo "Resolved build command: $resolved"
+          else
+            echo "No build command resolved (stack: $detected_stack)."
+          fi
+
+      - name: Decide whether to build
+        id: build_check
+        shell: bash
+        run: |
+          set -euo pipefail
+          mode="${BUILD_MODE:-auto}"
+          stack="${{ steps.resolve_build.outputs.stack }}"
+          build_command="${{ steps.resolve_build.outputs.command }}"
+          should_build="true"
+          reason="default"
+
+          if [ "$mode" = "always" ]; then
+            should_build="true"
+            reason="build_mode=always"
+          elif [ "$mode" = "never" ]; then
+            should_build="false"
+            reason="build_mode=never"
+          elif [ -z "$build_command" ]; then
+            should_build="false"
+            reason="no build command resolved"
+          elif [ "$stack" = "node-core" ] && [ -x "out/Release/node" ]; then
+            should_build="false"
+            reason="existing out/Release/node detected"
+          else
+            should_build="true"
+            reason="no existing build artifacts detected"
+          fi
+
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "Build decision: $should_build ($reason)"
+
+      - name: Optional build/install
+        if: ${{ steps.build_check.outputs.should_build == 'true' && steps.resolve_build.outputs.command != '' }}
+        run: ${{ steps.resolve_build.outputs.command }}
+
+      - name: ccache stats
+        if: ${{ steps.build_check.outputs.should_build == 'true' }}
+        run: ccache -s
+
+      - name: Save ccache
+        if: ${{ always() && steps.build_check.outputs.should_build == 'true' && !cancelled() && steps.ccache_restore.outputs.cache-primary-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache_restore.outputs.cache-primary-key }}
+
+      - name: Find previous universal map artifact on main
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        id: find_prev_map
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const currentRunId = Number(process.env.GITHUB_RUN_ID || "0");
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id: "map-builder.yaml",
+              branch: "main",
+              status: "completed",
+              per_page: 100
+            });
+
+            const previousRun = runs.find((r) =>
+              r.conclusion === "success" && Number(r.id) !== currentRunId
+            );
+
+            if (!previousRun) {
+              core.notice("No previous successful map-builder run found; using full rebuild.");
+              core.setOutput("has_prev_map", "false");
+              return;
+            }
+
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner,
+              repo,
+              run_id: previousRun.id,
+              per_page: 100
+            });
+
+            const mapArtifact = artifacts.find((a) => a.name === "universal-map" && !a.expired);
+            if (!mapArtifact) {
+              core.notice(`Run ${previousRun.id} has no non-expired universal-map artifact; using full rebuild.`);
+              core.setOutput("has_prev_map", "false");
+              return;
+            }
+
+            core.notice(`Using previous universal map from run ${previousRun.id}.`);
+            core.setOutput("has_prev_map", "true");
+            core.setOutput("run_id", String(previousRun.id));
+
+      - name: Download previous universal map artifact
+        if: ${{ steps.find_prev_map.outputs.has_prev_map == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: universal-map
+          path: prev_map
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find_prev_map.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare incremental inputs
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.find_prev_map.outputs.has_prev_map == 'true' }}
+        id: incremental_inputs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const before = context.payload.before || "";
+            const after = context.sha;
+
+            const emptyBefore = /^0+$/.test(before);
+            if (!before || emptyBefore) {
+              core.notice("No usable 'before' SHA in push payload; using full rebuild.");
+              core.setOutput("incremental_ready", "false");
+              return;
+            }
+
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner,
+              repo,
+              basehead: `${before}...${after}`
+            });
+
+            const files = comparison.data.files || [];
+            if (files.length === 0) {
+              core.notice("No changed files in compare payload; reusing previous map.");
+            }
+
+            const prDiff = files.map((f) => ({
+              filename: f.filename,
+              status: f.status,
+              patch: f.patch || null
+            }));
+            fs.writeFileSync("compare_pr_files.json", JSON.stringify(prDiff, null, 2));
+
+            const testFilePattern = /^test\/.+\.(?:js|mjs|cjs|ts|tsx|jsx|py|go|rs)$/;
+            const directChanged = [];
+            const removedTests = [];
+            for (const f of files) {
+              if (!testFilePattern.test(f.filename)) continue;
+              if (f.status === "removed") removedTests.push(f.filename);
+              else directChanged.push(f.filename);
+            }
+
+            fs.writeFileSync(
+              "direct_changed_tests.txt",
+              directChanged.length ? `${directChanged.join("\n")}\n` : "",
+              "utf8",
+            );
+            fs.writeFileSync(
+              "removed_tests.txt",
+              removedTests.length ? `${removedTests.join("\n")}\n` : "",
+              "utf8",
+            );
+
+            core.setOutput("incremental_ready", "true");
+            core.setOutput("changed_file_count", String(files.length));
+            core.setOutput("direct_changed_count", String(directChanged.length));
+            core.setOutput("removed_test_count", String(removedTests.length));
+            core.notice(
+              `Incremental inputs prepared: ${files.length} changed file(s), ${directChanged.length} directly changed test file(s), ${removedTests.length} removed test file(s).`,
+            );
+
+      - name: Generate universal map (per-test coverage)
+        env:
+          HAS_PREV_MAP: ${{ steps.find_prev_map.outputs.has_prev_map || 'false' }}
+          INCREMENTAL_READY: ${{ steps.incremental_inputs.outputs.incremental_ready || 'false' }}
+        run: |
+          set -euo pipefail
+          mkdir -p maps
+
+          PREV_MAP_PATH="prev_map/universal_coverage_map.json"
+          USE_INCREMENTAL="false"
+          if [ "${HAS_PREV_MAP:-false}" = "true" ] && [ "${INCREMENTAL_READY:-false}" = "true" ] && [ -f "$PREV_MAP_PATH" ]; then
+            USE_INCREMENTAL="true"
+          fi
+
+          if [ "$USE_INCREMENTAL" = "true" ]; then
+            echo "Running incremental map update."
+
+            node tools/universal-coverage/src/index.js select \
+              --map "$PREV_MAP_PATH" \
+              --pr "compare_pr_files.json" \
+              --out "impacted_from_map.txt"
+
+            cat impacted_from_map.txt direct_changed_tests.txt 2>/dev/null \
+              | sed '/^[[:space:]]*$/d' \
+              | sort -u > tests_to_refresh.txt || true
+
+            REFRESH_COUNT="$(wc -l < tests_to_refresh.txt | tr -d ' ')"
+            REMOVED_COUNT="$(wc -l < removed_tests.txt | tr -d ' ' || echo 0)"
+            echo "Tests to refresh: $REFRESH_COUNT"
+            echo "Tests to remove: $REMOVED_COUNT"
+
+            if [ "$REFRESH_COUNT" -eq 0 ]; then
+              echo "No tests to refresh. Reusing baseline map with removals applied."
+              printf '{"tests":[]}\n' > maps/universal_coverage_delta.json
+            else
+              node tools/universal-coverage/src/index.js map \
+                --format "$COVERAGE_FORMAT" \
+                --coverage "$COVERAGE_PATH" \
+                --test-list "cat tests_to_refresh.txt" \
+                --test-run "$TEST_RUN_TEMPLATE" \
+                --jobs "$MAP_JOBS" \
+                --auto-discover-tests "true" \
+                --continue-on-test-failure "true" \
+                --out "maps/universal_coverage_delta.json"
+            fi
+
+            MERGE_ARGS=(--base "$PREV_MAP_PATH" --delta "maps/universal_coverage_delta.json" --out "maps/universal_coverage_map.json")
+            if [ -s removed_tests.txt ]; then
+              MERGE_ARGS+=(--remove "removed_tests.txt")
+            fi
+            node tools/universal-coverage/src/index.js merge "${MERGE_ARGS[@]}"
+            exit 0
+          fi
+
+          echo "Running full map rebuild."
+          EFFECTIVE_TEST_LIST_COMMAND="$TEST_LIST_COMMAND"
+          if [ -n "$TEST_FILTER" ] && [ -n "$EFFECTIVE_TEST_LIST_COMMAND" ]; then
+            EFFECTIVE_TEST_LIST_COMMAND="$EFFECTIVE_TEST_LIST_COMMAND | grep -E '$TEST_FILTER'"
+          fi
+
+          if [ -n "$MAX_TESTS" ] && [ -n "$EFFECTIVE_TEST_LIST_COMMAND" ]; then
+            EFFECTIVE_TEST_LIST_COMMAND="$EFFECTIVE_TEST_LIST_COMMAND | head -n $MAX_TESTS"
+          fi
+
+          if [ -n "$EFFECTIVE_TEST_LIST_COMMAND" ]; then
+            echo "Using test list command:"
+            echo "$EFFECTIVE_TEST_LIST_COMMAND"
+          else
+            echo "No explicit test list command provided; map command will auto-discover."
+          fi
+
+          node tools/universal-coverage/src/index.js map \
+            --format "$COVERAGE_FORMAT" \
+            --coverage "$COVERAGE_PATH" \
+            --test-list "$EFFECTIVE_TEST_LIST_COMMAND" \
+            --test-run "$TEST_RUN_TEMPLATE" \
+            --jobs "$MAP_JOBS" \
+            --auto-discover-tests "true" \
+            --continue-on-test-failure "true" \
+            --out "maps/universal_coverage_map.json"
+
+      - name: Upload universal map artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: universal-map
+          path: maps/universal_coverage_map.json
+          if-no-files-found: error
