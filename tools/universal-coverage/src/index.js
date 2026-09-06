@@ -12,6 +12,7 @@ const {
 } = require('./lib/io');
 const { prDiffToChangedRanges } = require('./lib/diff');
 const { discoverTestSetup, discoverAllTestSetups } = require('./lib/discovery');
+const { loadRepoConfig } = require('./lib/config');
 
 function parseArgs(argv) {
   const args = {};
@@ -29,7 +30,9 @@ function parseArgs(argv) {
 }
 
 function parseCoverage(format, coveragePath) {
-  if (!fs.existsSync(coveragePath)) return new Map();
+  if (!fs.existsSync(coveragePath)) {
+    throw new Error(`Test produced no coverage file: ${coveragePath}`);
+  }
   if (format === 'jacoco') return parseJacoco(coveragePath);
   if (format === 'lcov') return parseLcov(coveragePath);
   if (format === 'c8') return parseC8(coveragePath);
@@ -67,11 +70,12 @@ function getCoveragePathForWorker(coveragePath, workerId) {
   return path.join(dir, `worker-${workerId}`, base);
 }
 
-function runShellCommand(cmd) {
+function runShellCommand(cmd, cwd = process.cwd()) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, {
       shell: true,
       stdio: 'inherit',
+      cwd,
     });
     child.on('error', reject);
     child.on('exit', (code, signal) => {
@@ -84,16 +88,64 @@ function runShellCommand(cmd) {
   });
 }
 
+function runConfiguredSetup(configured, args) {
+  if (configured?.setup_command && args['skip-setup'] !== 'true') {
+    console.log(`Running setup from ${configured.config_path}`);
+    execSync(configured.setup_command, {
+      cwd: configured.working_directory, stdio: 'inherit',
+    });
+  }
+}
+
+function requireRepoConfig(args) {
+  const configured = loadRepoConfig({ configPath: args.config });
+  if (!configured) throw new Error('This command requires testpilot.yml (or --config <path>)');
+  return configured;
+}
+
+function cmdSetup(args) {
+  runConfiguredSetup(requireRepoConfig(args), args);
+}
+
+function cmdRun(args) {
+  const configured = requireRepoConfig(args);
+  const full = args.full === 'true';
+  if (full === Boolean(args.tests)) {
+    throw new Error('run requires exactly one of --full or --tests <selected_tests.txt>');
+  }
+  const tests = full ? [] : fs.readFileSync(args.tests, 'utf8')
+    .split(/\r?\n/).map(test => test.trim()).filter(Boolean);
+  runConfiguredSetup(configured, args);
+  const cwd = configured.working_directory;
+  if (full || tests.length === 0) {
+    if (!full) console.log('No selected tests; running the configured full suite.');
+    execSync(configured.full_test_command, { cwd, stdio: 'inherit' });
+    return;
+  }
+  const coveragePath = (args.coverage || configured.coverage_path).replaceAll('{{WORKER}}', '1');
+  fs.mkdirSync(path.dirname(path.resolve(cwd, coveragePath)), { recursive: true });
+  for (const test of new Set(tests)) {
+    const command = expandTemplate(args['test-run'] || configured.test_run_command_template, {
+      TEST: test, WORKER: 1, COVERAGE_PATH: coveragePath,
+      COVERAGE_DIR: path.dirname(coveragePath),
+    });
+    execSync(command, { cwd, stdio: 'inherit' });
+  }
+}
+
 async function cmdMap(args) {
-  const format = args.format;
-  const coveragePath = args.coverage;
+  const configured = loadRepoConfig({ configPath: args.config });
+  const autoDiscoverTests = args['auto-discover-tests'] === 'true';
+  const cwd = configured?.working_directory || process.cwd();
+  const format = args.format || configured?.coverage_format || (autoDiscoverTests ? 'c8' : null);
+  const coveragePath = args.coverage || configured?.coverage_path ||
+    (autoDiscoverTests ? 'coverage/coverage-final.json' : null);
   const outPath = args.out;
   const continueOnTestFailure = args['continue-on-test-failure'] === 'true';
-  const autoDiscoverTests = args['auto-discover-tests'] === 'true';
   let jobs = parsePositiveInt(args.jobs || '1', 1);
 
-  let testListCmd = args['test-list'];
-  let testRunTemplate = args['test-run'];
+  let testListCmd = args['test-list'] || configured?.test_list_command;
+  let testRunTemplate = args['test-run'] || configured?.test_run_command_template;
 
   if ((!testListCmd || !testRunTemplate) && autoDiscoverTests) {
     const detected = discoverTestSetup({ probe: true });
@@ -124,10 +176,15 @@ async function cmdMap(args) {
     );
   }
 
+  if (!['c8', 'lcov', 'jacoco'].includes(format)) {
+    throw new Error(`Unsupported format: ${format}`);
+  }
+
   if (
     jobs > 1 &&
     !testRunTemplate.includes('{{WORKER}}') &&
     !testRunTemplate.includes('{{COVERAGE_PATH}}') &&
+    !testRunTemplate.includes('{{COVERAGE_DIR}}') &&
     !coveragePath.includes('{{WORKER}}')
   ) {
     console.warn(
@@ -136,11 +193,13 @@ async function cmdMap(args) {
     jobs = 1;
   }
 
-  // Get tests (one per line)
-  const testList = execSync(testListCmd, { encoding: 'utf8' })
+  runConfiguredSetup(configured, args);
+  // Commands print only one test ID per line on stdout; diagnostics belong on stderr.
+  const testList = [...new Set(execSync(testListCmd, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
     .split('\n')
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter(Boolean))];
+  if (testList.length === 0) throw new Error('Test discovery returned no tests; refusing to write an empty coverage map');
   console.log(
     `Mapping ${testList.length} test(s) with ${jobs} worker(s).`,
   );
@@ -156,14 +215,17 @@ async function cmdMap(args) {
 
   try {
     let nextIndex = 0;
+    let fatalError = null;
     const runWorker = async (workerId) => {
       while (true) {
+        if (fatalError) return;
         const idx = nextIndex++;
         if (idx >= testList.length) return;
 
         const testId = testList[idx];
         const workerCoveragePath =
-          jobs === 1 ? coveragePath : getCoveragePathForWorker(coveragePath, workerId);
+          jobs === 1 ? coveragePath.replaceAll('{{WORKER}}', String(workerId)) : getCoveragePathForWorker(coveragePath, workerId);
+        const reportPath = path.resolve(cwd, workerCoveragePath);
         const cmd = expandTemplate(testRunTemplate, {
           TEST: testId,
           WORKER: workerId,
@@ -173,17 +235,24 @@ async function cmdMap(args) {
 
         console.log(`\n=== Running test (worker ${workerId}): ${testId} ===\n${cmd}\n`);
 
+        let fileToLines;
         try {
-          if (jobs === 1) execSync(cmd, { stdio: 'inherit' });
-          else await runShellCommand(cmd);
+          fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+          fs.rmSync(reportPath, { force: true });
+          if (jobs === 1) execSync(cmd, { cwd, stdio: 'inherit' });
+          else await runShellCommand(cmd, cwd);
+          fileToLines = parseCoverage(format, reportPath);
+          if (fileToLines.size === 0) throw new Error(`Coverage report contains no source files: ${reportPath}`);
         } catch (err) {
-          if (!continueOnTestFailure) throw err;
+          if (!continueOnTestFailure) {
+            fatalError = err;
+            throw err;
+          }
           failedTests.push(testId);
-          console.warn(`Skipping failed test in map generation: ${testId}`);
+          console.warn(`Skipping failed test in map generation: ${testId}: ${err.message}`);
           continue;
         }
 
-        const fileToLines = parseCoverage(format, workerCoveragePath);
         const entry = buildUniversalTestEntry(testId, fileToLines);
         if (wroteAnyEntry) fs.writeSync(outFd, ',\n');
         fs.writeSync(outFd, JSON.stringify(entry));
@@ -197,7 +266,10 @@ async function cmdMap(args) {
     for (let worker = 1; worker <= workerCount; worker += 1) {
       workers.push(runWorker(worker));
     }
-    await Promise.all(workers);
+    const results = await Promise.allSettled(workers);
+    const failure = results.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
+    if (mappedCount === 0) throw new Error('No tests produced usable coverage; refusing to write an empty coverage map');
 
     fs.writeSync(outFd, '\n]}\n');
     writeCompleted = true;
@@ -218,13 +290,19 @@ async function cmdMap(args) {
 
 function cmdDiscover(args) {
   const outPath = args.out;
-  const candidates = discoverAllTestSetups({ probe: true });
+  const candidates = discoverAllTestSetups({ probe: true, configPath: args.config });
   const detected = candidates[0];
   const payload = {
     adapter: detected.adapter,
     source: detected.source,
     confidence: detected.confidence,
     score: detected.score ?? detected.confidence,
+    config_path: detected.config_path || null,
+    working_directory: detected.working_directory || process.cwd(),
+    setup_command: detected.setup_command || null,
+    full_test_command: detected.full_test_command || null,
+    coverage_format: detected.coverage_format || null,
+    coverage_path: detected.coverage_path || null,
     test_list_command: detected.test_list_command,
     test_run_command_template: detected.test_run_command_template,
     probe: detected.probe || null,
@@ -412,16 +490,20 @@ async function cmdSelect(args) {
 
   try {
     if (cmd === 'map') return await cmdMap(args);
+    if (cmd === 'setup') return cmdSetup(args);
+    if (cmd === 'run') return cmdRun(args);
     if (cmd === 'discover') return cmdDiscover(args);
     if (cmd === 'select') return await cmdSelect(args);
     if (cmd === 'merge') return await cmdMerge(args);
     console.log('Usage:');
     console.log(
-      '  node src/index.js map --format c8|lcov|jacoco --coverage <path> --test-list <cmd> --test-run <cmdTemplate> [--jobs <n>] [--auto-discover-tests true] [--continue-on-test-failure true] --out <json>',
+      '  node src/index.js map --out <json> [--config <path>] [--format c8|lcov|jacoco] [--coverage <path>] [--test-list <cmd>] [--test-run <cmdTemplate>] [--jobs <n>] [--skip-setup true] [--auto-discover-tests true] [--continue-on-test-failure true]',
     );
     console.log(
-      '  node src/index.js discover [--out <json>]',
+      '  node src/index.js discover [--config <path>] [--out <json>]',
     );
+    console.log('  node src/index.js setup [--config <path>]');
+    console.log('  node src/index.js run (--full | --tests <selected_tests.txt>) [--config <path>] [--skip-setup true]');
     console.log(
       '  node src/index.js select --map <json> --pr <pr_files.json> --out <selected_tests.txt>',
     );

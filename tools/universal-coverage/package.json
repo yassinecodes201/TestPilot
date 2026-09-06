@@ -2,7 +2,11 @@
   "name": "universal-coverage",
   "private": true,
   "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
-    "xml2js": "^0.6.2"
+    "xml2js": "^0.6.2",
+    "yaml": "^2.8.1"
   }
 }

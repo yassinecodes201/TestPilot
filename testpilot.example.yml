@@ -1,0 +1,9 @@
+# Copy to testpilot.yml in the repository being tested, then supply your commands.
+adapter: custom
+setup: ./ci/install.sh
+discover: ./ci/list-tests.sh
+run: ./ci/run-test.sh "{{TEST}}" "{{COVERAGE_PATH}}"
+full: ./ci/run-all.sh
+coverage:
+  format: lcov
+  path: coverage/lcov.info

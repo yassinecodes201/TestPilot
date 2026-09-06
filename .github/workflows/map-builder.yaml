@@ -6,13 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       coverage_format:
-        description: 'jacoco, lcov, or c8'
-        required: true
-        default: 'c8'
+        description: 'Optional coverage format override: jacoco, lcov, or c8. Otherwise use testpilot.yml or auto-detection.'
+        required: false
+        default: ''
       coverage_path:
-        description: 'Path to coverage file (e.g. coverage/coverage-final.json, coverage/lcov.info, or target/site/jacoco/jacoco.xml)'
-        required: true
-        default: 'coverage/coverage-final.json'
+        description: 'Optional coverage file override. Otherwise use testpilot.yml or auto-detection.'
+        required: false
+        default: ''
       test_list_command:
         description: 'Optional command that prints one test id per line. If empty, auto-discovery is used.'
         required: false
@@ -34,7 +34,7 @@ on:
         required: false
         default: '8'
       build_command:
-        description: 'Build/install step. Use auto to detect stack, empty to skip, or provide an explicit command.'
+        description: 'Build/install step. Use auto for testpilot.yml setup or stack detection, empty to skip, or provide an explicit command.'
         required: false
         default: 'auto'
       build_mode:
@@ -56,14 +56,14 @@ jobs:
   build-map:
     runs-on: ubuntu-latest
     env:
-      COVERAGE_FORMAT: ${{ inputs.coverage_format || 'c8' }}
-      COVERAGE_PATH: ${{ inputs.coverage_path || 'coverage/coverage-final.json' }}
+      COVERAGE_FORMAT: ${{ inputs.coverage_format || '' }}
+      COVERAGE_PATH: ${{ inputs.coverage_path || '' }}
       TEST_LIST_COMMAND: ${{ inputs.test_list_command || '' }}
       TEST_RUN_TEMPLATE: ${{ inputs.test_run_command_template || '' }}
       TEST_FILTER: ${{ inputs.test_filter || '' }}
       MAX_TESTS: ${{ inputs.max_tests || '' }}
       MAP_JOBS: ${{ inputs.map_jobs || '8' }}
-      BUILD_COMMAND: ${{ inputs.build_command || 'auto' }}
+      BUILD_COMMAND: ${{ github.event_name != 'workflow_dispatch' && 'auto' || inputs.build_command }}
       BUILD_MODE: ${{ inputs.build_mode || 'auto' }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPRESS: '1'
@@ -114,14 +114,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          requested="${BUILD_COMMAND:-auto}"
-          requested="$(echo "$requested" | xargs)"
+          requested="${BUILD_COMMAND:-}"
+          requested="${requested#"${requested%%[![:space:]]*}"}"
+          requested="${requested%"${requested##*[![:space:]]}"}"
           detected_stack="unknown"
           resolved=""
+          config_present="false"
+          if [ -f "testpilot.yml" ] || [ -f "testpilot.yaml" ]; then
+            config_present="true"
+          fi
 
-          if [ -n "$requested" ] && [ "$requested" != "auto" ]; then
+          if [ -z "$requested" ]; then
+            detected_stack="skipped"
+          elif [ "$requested" != "auto" ]; then
             detected_stack="manual"
             resolved="$requested"
+          elif [ "$config_present" = "true" ]; then
+            detected_stack="config"
+            node tools/universal-coverage/src/index.js discover --out "$RUNNER_TEMP/testpilot-discovery.json"
+            has_setup="$(node -e 'const fs = require("fs"); const config = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(config.setup_command ? "true" : "false");' "$RUNNER_TEMP/testpilot-discovery.json")"
+            if [ "$has_setup" = "true" ]; then
+              resolved='node tools/universal-coverage/src/index.js setup'
+            fi
           elif [ -f "tools/test.py" ] && [ -f "configure" ]; then
             detected_stack="node-core"
             resolved='make build-ci -j$(nproc) V=1 CONFIG_FLAGS="--coverage" && make coverage-build-js'
@@ -130,7 +144,7 @@ jobs:
             if [ -f "pnpm-lock.yaml" ]; then
               resolved='corepack enable && pnpm install --frozen-lockfile'
             elif [ -f "yarn.lock" ]; then
-              resolved='corepack enable && yarn install --immutable'
+              resolved='corepack enable && if [[ "$(yarn --version)" == 1.* ]]; then yarn install --frozen-lockfile; else yarn install --immutable; fi'
             elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
               resolved='npm ci --prefer-offline --no-audit --no-fund'
             else
@@ -165,6 +179,7 @@ jobs:
           fi
 
           {
+            echo "config_present=$config_present"
             echo "stack=$detected_stack"
             echo "command<<EOF"
             echo "$resolved"
@@ -181,11 +196,14 @@ jobs:
       - name: Decide whether to build
         id: build_check
         shell: bash
+        env:
+          RESOLVED_STACK: ${{ steps.resolve_build.outputs.stack }}
+          RESOLVED_BUILD_COMMAND: ${{ steps.resolve_build.outputs.command }}
         run: |
           set -euo pipefail
           mode="${BUILD_MODE:-auto}"
-          stack="${{ steps.resolve_build.outputs.stack }}"
-          build_command="${{ steps.resolve_build.outputs.command }}"
+          stack="$RESOLVED_STACK"
+          build_command="$RESOLVED_BUILD_COMMAND"
           should_build="true"
           reason="default"
 
@@ -226,7 +244,7 @@ jobs:
           key: ${{ steps.ccache_restore.outputs.cache-primary-key }}
 
       - name: Find previous universal map artifact on main
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.resolve_build.outputs.config_present != 'true' }}
         id: find_prev_map
         uses: actions/github-script@v7
         with:
@@ -308,6 +326,11 @@ jobs:
             });
 
             const files = comparison.data.files || [];
+            if (files.some((file) => [file.filename, file.previous_filename].some((name) => /^testpilot\.ya?ml$/.test(name || "")))) {
+              core.notice("TestPilot configuration changed or was removed; using full rebuild.");
+              core.setOutput("incremental_ready", "false");
+              return;
+            }
             if (files.length === 0) {
               core.notice("No changed files in compare payload; reusing previous map.");
             }
@@ -319,7 +342,7 @@ jobs:
             }));
             fs.writeFileSync("compare_pr_files.json", JSON.stringify(prDiff, null, 2));
 
-            const testFilePattern = /^test\/.+\.(?:js|mjs|cjs|ts|tsx|jsx|py|go|rs)$/;
+            const testFilePattern = /(?:^test\/.+\.(?:js|mjs|cjs|ts|tsx|jsx|py|go|rs)$|(?:^|\/)__tests__\/[^/]+\.(?:js|mjs|cjs|ts|tsx|jsx|coffee)$|\.(?:test|spec)\.(?:js|mjs|cjs|ts|tsx|jsx)$)/;
             const directChanged = [];
             const removedTests = [];
             for (const f of files) {
@@ -351,13 +374,14 @@ jobs:
         env:
           HAS_PREV_MAP: ${{ steps.find_prev_map.outputs.has_prev_map || 'false' }}
           INCREMENTAL_READY: ${{ steps.incremental_inputs.outputs.incremental_ready || 'false' }}
+          CONFIG_PRESENT: ${{ steps.resolve_build.outputs.config_present || 'false' }}
         run: |
           set -euo pipefail
           mkdir -p maps
 
           PREV_MAP_PATH="prev_map/universal_coverage_map.json"
           USE_INCREMENTAL="false"
-          if [ "${HAS_PREV_MAP:-false}" = "true" ] && [ "${INCREMENTAL_READY:-false}" = "true" ] && [ -f "$PREV_MAP_PATH" ]; then
+          if [ "${CONFIG_PRESENT:-false}" != "true" ] && [ "${HAS_PREV_MAP:-false}" = "true" ] && [ "${INCREMENTAL_READY:-false}" = "true" ] && [ -f "$PREV_MAP_PATH" ]; then
             USE_INCREMENTAL="true"
           fi
 
@@ -388,6 +412,7 @@ jobs:
                 --test-list "cat tests_to_refresh.txt" \
                 --test-run "$TEST_RUN_TEMPLATE" \
                 --jobs "$MAP_JOBS" \
+                --skip-setup "true" \
                 --auto-discover-tests "true" \
                 --continue-on-test-failure "true" \
                 --out "maps/universal_coverage_delta.json"
@@ -424,6 +449,7 @@ jobs:
             --test-list "$EFFECTIVE_TEST_LIST_COMMAND" \
             --test-run "$TEST_RUN_TEMPLATE" \
             --jobs "$MAP_JOBS" \
+            --skip-setup "true" \
             --auto-discover-tests "true" \
             --continue-on-test-failure "true" \
             --out "maps/universal_coverage_map.json"

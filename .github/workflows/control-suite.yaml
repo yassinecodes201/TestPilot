@@ -1,0 +1,64 @@
+name: Control Suite Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      customer_owner:
+        description: Customer repo owner
+        required: true
+        type: string
+      customer_repo:
+        description: Customer repo name
+        required: true
+        type: string
+      installation_id:
+        description: GitHub App installation ID
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      head_sha:
+        description: Head commit SHA
+        required: true
+        type: string
+      mode:
+        description: suggested or full
+        required: true
+        type: string
+      source:
+        description: Trigger source
+        required: true
+        type: string
+      actor:
+        description: GitHub user who triggered
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print dispatch payload
+        run: |
+          echo "customer_owner=${{ inputs.customer_owner }}"
+          echo "customer_repo=${{ inputs.customer_repo }}"
+          echo "installation_id=${{ inputs.installation_id }}"
+          echo "pr_number=${{ inputs.pr_number }}"
+          echo "head_sha=${{ inputs.head_sha }}"
+          echo "mode=${{ inputs.mode }}"
+          echo "source=${{ inputs.source }}"
+          echo "actor=${{ inputs.actor }}"
+
+      # TODO: Replace this with your private checkout + test execution logic.
+      - name: Placeholder
+        run: |
+          if [ "${{ inputs.mode }}" = "full" ]; then
+            echo "Run full suite"
+          else
+            echo "Run suggested suite"
+          fi

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+const { loadRepoConfig } = require('./config');
 
 function exists(p) {
   return fs.existsSync(p);
@@ -64,6 +65,29 @@ function detectNodeCoreRepo(cwd) {
       "find test -type f \\( -name 'test-*.js' -o -name 'test-*.mjs' \\) ! -path '*/fixtures/*' | sed -E 's#^test/##; s#\\.(mjs|js)$##' | sort",
     test_run_command_template:
       'rm -rf "coverage/tmp-{{WORKER}}" "{{COVERAGE_PATH}}" && mkdir -p "coverage/tmp-{{WORKER}}" "$(dirname "{{COVERAGE_PATH}}")" && NODE_V8_COVERAGE="coverage/tmp-{{WORKER}}" python3 tools/test.py --mode=release --type=coverage -j1 {{TEST}} && npx c8 report --reporter=json --report-dir="$(dirname "{{COVERAGE_PATH}}")" --temp-directory="coverage/tmp-{{WORKER}}"',
+  };
+}
+
+function detectReactSourceRepo(cwd) {
+  const nodePkg = detectNodePackage(cwd);
+  if (!nodePkg ||
+      !/scripts\/jest\/jest-cli\.js/.test(nodePkg.scripts.test || '') ||
+      !hasAnyFile(cwd, ['scripts/jest/jest-cli.js']) ||
+      !hasAnyFile(cwd, ['scripts/jest/config.source.js'])) return null;
+
+  const runner = path.resolve(__dirname, '../runners/react-jest.js');
+  return {
+    adapter: 'react-source-jest',
+    source: 'repo-specific',
+    confidence: 1,
+    required_commands: ['node'],
+    test_list_command: `node "${runner}" list`,
+    test_run_command_template:
+      `node "${runner}" run "{{TEST}}" "{{COVERAGE_PATH}}"`,
+    warnings: [
+      'React source tests use the default experimental/development configuration. Compiler and DevTools suites require separate configuration.',
+      'Use --format c8 for the native Jest JSON coverage report.',
+    ],
   };
 }
 
@@ -345,6 +369,7 @@ function probeCandidate(candidate, options = {}) {
 function createDetectorList() {
   return [
     detectNodeCoreRepo,
+    detectReactSourceRepo,
     detectJest,
     detectVitest,
     detectPytest,
@@ -359,6 +384,8 @@ function createDetectorList() {
 
 function discoverAllTestSetups(options = {}) {
   const cwd = options.cwd || process.cwd();
+  const configured = loadRepoConfig({ cwd, configPath: options.configPath });
+  if (configured) return [configured];
   const shouldProbe = options.probe !== false;
   const candidates = [];
 
