@@ -28,9 +28,14 @@ Set webhook URL to:
 
 `https://<your-domain>/github/webhook`
 
+Also subscribe webhook events to include:
+- `Pull request`
+- `Issue comment`
+- `Pull request review comment`
+
 ## 4) Trigger flow
-- Open or reopen PR -> app creates a `TestPilot` check with actions.
-- Click `Run Suggested` or `Run Full`, or comment:
+- Open/reopen/update PR -> app dispatches `control-suite.yaml` with `mode=suggested`.
+- Comment on the PR or inline review comment:
   - `/testpilot suggested`
   - `/testpilot full`
 - App dispatches `control-suite.yaml` in your control repo.
