@@ -1,6 +1,7 @@
 # TestPilot App Setup
 
 ## 1) Configure env
+
 Copy `server/.env.example` values into your shell env.
 
 PowerShell example:
@@ -24,16 +25,19 @@ npm start
 ```
 
 ## 3) Configure GitHub App webhook URL
+
 Set webhook URL to:
 
 `https://<your-domain>/github/webhook`
 
 Also subscribe webhook events to include:
+
 - `Pull request`
 - `Issue comment`
 - `Pull request review comment`
 
 ## 4) Trigger flow
+
 - Open/reopen/update PR -> app dispatches `control-suite.yaml` with `mode=suggested`.
 - Comment on the PR or inline review comment:
   - `/testpilot suggested`

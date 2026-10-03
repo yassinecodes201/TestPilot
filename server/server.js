@@ -16,15 +16,26 @@ const GITHUB_APP_ID = Number(process.env.APP_ID);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const CONTROL_REPO_OWNER = process.env.CONTROL_REPO_OWNER;
 const CONTROL_REPO_NAME = process.env.CONTROL_REPO_NAME;
-const CONTROL_WORKFLOW_ID = process.env.CONTROL_WORKFLOW_ID || "control-suite.yaml";
+const CONTROL_WORKFLOW_ID =
+  process.env.CONTROL_WORKFLOW_ID || "control-suite.yaml";
 const CONTROL_WORKFLOW_REF = process.env.CONTROL_WORKFLOW_REF || "main";
 
 console.log("APP_ID:", GITHUB_APP_ID);
 console.log("WEBHOOK_SECRET set:", Boolean(WEBHOOK_SECRET));
-console.log("Private key source:", process.env.PRIVATE_KEY?.trim() ? "PRIVATE_KEY environment variable" : path.resolve(PRIVATE_KEY_PATH));
+console.log(
+  "Private key source:",
+  process.env.PRIVATE_KEY?.trim()
+    ? "PRIVATE_KEY environment variable"
+    : path.resolve(PRIVATE_KEY_PATH),
+);
 console.log(
   "CONTROL workflow configured:",
-  Boolean(CONTROL_REPO_OWNER && CONTROL_REPO_NAME && CONTROL_WORKFLOW_ID && CONTROL_WORKFLOW_REF),
+  Boolean(
+    CONTROL_REPO_OWNER &&
+    CONTROL_REPO_NAME &&
+    CONTROL_WORKFLOW_ID &&
+    CONTROL_WORKFLOW_REF,
+  ),
 );
 
 // Logs all hits before JSON parsing/signature verification.
@@ -72,7 +83,12 @@ function parseTestPilotChoice(rawComment) {
 }
 
 function ensureControlWorkflowConfig() {
-  if (!CONTROL_REPO_OWNER || !CONTROL_REPO_NAME || !CONTROL_WORKFLOW_ID || !CONTROL_WORKFLOW_REF) {
+  if (
+    !CONTROL_REPO_OWNER ||
+    !CONTROL_REPO_NAME ||
+    !CONTROL_WORKFLOW_ID ||
+    !CONTROL_WORKFLOW_REF
+  ) {
     throw new Error(
       "Missing CONTROL workflow env vars. Set CONTROL_REPO_OWNER, CONTROL_REPO_NAME, CONTROL_WORKFLOW_ID, CONTROL_WORKFLOW_REF.",
     );
@@ -112,7 +128,13 @@ async function dispatchControlWorkflow({
   }
 
   const octokit = await githubApp.getInstallationOctokit(installationId);
-  const headSha = await resolvePrHeadSha(octokit, customerOwner, customerRepo, prNumber, payload);
+  const headSha = await resolvePrHeadSha(
+    octokit,
+    customerOwner,
+    customerRepo,
+    prNumber,
+    payload,
+  );
 
   await octokit.actions.createWorkflowDispatch({
     owner: CONTROL_REPO_OWNER,
