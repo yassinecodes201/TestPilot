@@ -24,14 +24,14 @@ all other fields are required. This version supports one custom configuration
 per file; it does not support a `projects:` list or built-in adapter names in the
 configuration file.
 
-| Field | Contract |
-| --- | --- |
-| `setup` | Install dependencies or prepare the project. Runs once before `map` or `run`, unless `--skip-setup true` is passed. |
-| `discover` | Print one stable test ID per line to stdout. Send progress/log messages to stderr. IDs can be file paths or runner-specific identifiers. |
-| `run` | Run exactly the test ID substituted for `{{TEST}}`. For mapping, also write a fresh coverage report for that test. |
-| `full` | Run the full test suite. |
-| `coverage.format` | `lcov`, `c8` (Istanbul JSON), or `jacoco` (XML). |
-| `coverage.path` | Report file path relative to the configuration directory. Absolute paths and `..` are rejected. |
+| Field             | Contract                                                                                                                                 |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `setup`           | Install dependencies or prepare the project. Runs once before `map` or `run`, unless `--skip-setup true` is passed.                      |
+| `discover`        | Print one stable test ID per line to stdout. Send progress/log messages to stderr. IDs can be file paths or runner-specific identifiers. |
+| `run`             | Run exactly the test ID substituted for `{{TEST}}`. For mapping, also write a fresh coverage report for that test.                       |
+| `full`            | Run the full test suite.                                                                                                                 |
+| `coverage.format` | `lcov`, `c8` (Istanbul JSON), or `jacoco` (XML).                                                                                         |
+| `coverage.path`   | Report file path relative to the configuration directory. Absolute paths and `..` are rejected.                                          |
 
 Commands run in the configuration file's directory, using the host shell
 (`/bin/sh` on Unix, `cmd.exe` on Windows); use commands available on your runner.
@@ -91,6 +91,8 @@ command overrides setup, and `build_mode: never` skips it. Configured repositori
 get a full map rebuild because custom test IDs cannot be inferred from filenames.
 Repositories without a config retain automatic runner detection. This adds CLI
 and map-builder support; the webhook/control-suite placeholder is separate.
+Built-in Node test-runner projects are also auto-detected when package scripts
+use `node --test`, with per-test coverage mapped through c8.
 
 ## React source repository
 
