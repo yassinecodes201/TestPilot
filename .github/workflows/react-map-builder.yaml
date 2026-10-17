@@ -112,7 +112,7 @@ jobs:
             --format c8 \
             --coverage coverage/coverage-final.json \
             --test-list "cat ../react-map/selected-tests.txt" \
-            --test-run 'node ../testpilot/tools/universal-coverage/src/runners/react-jest.js run "{{TEST}}" "{{COVERAGE_PATH}}"' \
+            --test-run 'node scripts/jest/jest-cli.js --ci --sourceMaps --runInBand --watch=false --coverage --coverageProvider=v8 --coverageReporters=json --coverageDirectory="{{COVERAGE_DIR}}" --runTestsByPath "{{TEST}}"' \
             --jobs "$MAP_JOBS" \
             --out ../react-map/universal_coverage_map.json
 
