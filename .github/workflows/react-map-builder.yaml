@@ -1,0 +1,167 @@
+name: Build React Coverage Map
+
+on:
+  workflow_dispatch:
+    inputs:
+      react_ref:
+        description: 'React branch, tag, or commit'
+        default: main
+        required: true
+        type: string
+      max_tests:
+        description: 'Maximum test files to map; 0 maps the entire supported source suite'
+        default: '0'
+        required: true
+        type: string
+      map_jobs:
+        description: 'Parallel coverage workers (1-4)'
+        default: '2'
+        required: true
+        type: string
+  push:
+    branches: [codex/react-coverage-map]
+    paths:
+      - .github/workflows/react-map-builder.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  react-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      MAX_TESTS: ${{ inputs.max_tests || '3' }}
+      MAP_JOBS: ${{ inputs.map_jobs || '2' }}
+      CI: 'true'
+    steps:
+      - name: Check out TestPilot
+        uses: actions/checkout@v4
+        with:
+          path: testpilot
+          persist-credentials: false
+
+      - name: Check out React
+        uses: actions/checkout@v4
+        with:
+          repository: facebook/react
+          ref: ${{ inputs.react_ref || 'main' }}
+          path: react
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          [[ "$MAX_TESTS" =~ ^[0-9]+$ ]] || { echo "max_tests must be a nonnegative integer"; exit 1; }
+          [[ "$MAP_JOBS" =~ ^[1-4]$ ]] || { echo "map_jobs must be between 1 and 4"; exit 1; }
+
+      - name: Install TestPilot dependencies
+        working-directory: testpilot/tools/universal-coverage
+        run: npm ci --no-audit --no-fund
+
+      - name: Install React dependencies using its pinned Yarn version
+        working-directory: react
+        shell: bash
+        run: |
+          corepack enable
+          if [[ "$(yarn --version)" == 1.* ]]; then
+            yarn install --frozen-lockfile
+          else
+            yarn install --immutable
+          fi
+
+      - name: Discover React tests and record map scope
+        working-directory: react
+        shell: bash
+        run: |
+          mkdir -p ../react-map
+          node ../testpilot/tools/universal-coverage/src/runners/react-jest.js list > ../react-map/discovered-tests.txt
+          node <<'NODE'
+          const fs = require('fs');
+          const {execFileSync} = require('child_process');
+          const all = [...new Set(fs.readFileSync('../react-map/discovered-tests.txt', 'utf8')
+            .split(/\r?\n/).map(s => s.trim()).filter(Boolean))].sort();
+          if (!all.length) throw new Error('React discovery returned no tests');
+          const limit = Number(process.env.MAX_TESTS);
+          if (!Number.isSafeInteger(limit)) throw new Error('Invalid max_tests');
+          const tests = limit === 0 ? all : all.slice(0, limit);
+          fs.writeFileSync('../react-map/selected-tests.txt', tests.join('\n') + '\n');
+          const metadata = {
+            repository: 'facebook/react',
+            react_sha: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(),
+            testpilot_sha: execFileSync('git', ['-C', '../testpilot', 'rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(),
+            suite: 'default experimental development source suite',
+            discovered_test_files: all.length,
+            requested_test_files: tests.length,
+            scope: tests.length === all.length ? 'full-supported-suite' : 'partial-trial',
+            status: 'pending'
+          };
+          fs.writeFileSync('../react-map/metadata.json', JSON.stringify(metadata, null, 2));
+          console.log(metadata);
+          NODE
+
+      - name: Build React map with per-test coverage
+        working-directory: react
+        shell: bash
+        run: |
+          node ../testpilot/tools/universal-coverage/src/index.js map \
+            --format c8 \
+            --coverage coverage/coverage-final.json \
+            --test-list "cat ../react-map/selected-tests.txt" \
+            --test-run 'node ../testpilot/tools/universal-coverage/src/runners/react-jest.js run "{{TEST}}" "{{COVERAGE_PATH}}"' \
+            --jobs "$MAP_JOBS" \
+            --out ../react-map/universal_coverage_map.json
+
+      - name: Verify map and summarize
+        working-directory: react
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const map = JSON.parse(fs.readFileSync('../react-map/universal_coverage_map.json', 'utf8'));
+          const metadata = JSON.parse(fs.readFileSync('../react-map/metadata.json', 'utf8'));
+          const expected = fs.readFileSync('../react-map/selected-tests.txt', 'utf8').trim().split('\n');
+          const actual = new Set(map.tests.map(t => t.id));
+          if (actual.size !== expected.length || expected.some(t => !actual.has(t))) {
+            throw new Error('Map does not contain every requested test');
+          }
+          for (const test of map.tests) {
+            const covered = test.files.some(f => Array.isArray(f.lines) && f.lines.length > 0 &&
+              fs.existsSync(path.resolve(f.path)));
+            if (!covered) throw new Error('No covered React source found for ' + test.id);
+          }
+          metadata.status = 'complete';
+          metadata.mapped_test_files = map.tests.length;
+          fs.writeFileSync('../react-map/metadata.json', JSON.stringify(metadata, null, 2));
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            '# React coverage map\n\n' +
+            '- React commit: ' + metadata.react_sha + '\n' +
+            '- Scope: ' + metadata.scope + '\n' +
+            '- Suite: ' + metadata.suite + '\n' +
+            '- Mapped test files: ' + map.tests.length + ' / ' + metadata.discovered_test_files + '\n\n' +
+            'Download the react-universal-map artifact. A partial trial is not a full-suite baseline.\n');
+          NODE
+
+      - name: Upload verified React map
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-universal-map
+          path: react-map/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics if mapping fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-map-diagnostics
+          path: |
+            react-map/metadata.json
+            react-map/discovered-tests.txt
+            react-map/selected-tests.txt
+          if-no-files-found: ignore
